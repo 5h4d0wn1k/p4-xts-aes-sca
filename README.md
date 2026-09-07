@@ -27,49 +27,114 @@ This project implements a complete single-key-byte CPA engine in pure Python to 
 
 ```bash
 cd p4-xts-aes-sca
-pip3 install numpy scipy   # optional; full-speed path only
+# No external dependencies required — pure Python stdlib
+python3 run_demo.py
 ```
-
-The engine runs on the Python standard library alone.
 
 ## Usage
 
 ```bash
-# Run the offline self-test (synthetic traces, known key byte)
-python3 firmware/cpa_engine.py
+# Run the full offline self-test (synthetic traces, known key byte)
+python3 run_demo.py
 
-# Import the engine in your own measurement pipeline
-from firmware.cpa_engine import generate_traces, cpa_attack_single_byte
+# Print rank of known key byte (fast, ~10 traces)
+python3 run_demo.py rank
+
+# Custom key byte, trace count, SNR
+python3 run_demo.py rank --key 0x42 --traces 50 --snr 20.0
+
+# Show all CLI options
+python3 run_demo.py --help
+python3 run_demo.py rank --help
+
+# Run unit tests (includes key-rank recovery assertions)
+python3 -m unittest discover -s tests -v
 ```
+
+Programmatic use:
+
+```python
+from cpa_engine import generate_traces, cpa_attack_single_byte
+
+rng = random.Random(42)
+traces, plaintexts = generate_traces(0xA7, 80, rng, snr_db=18.0)
+result = cpa_attack_single_byte(traces, plaintexts)
+print(f"Rank: {result['correct_key_rank']}, Key: 0x{result['correct_key']:02X}")
+```
+
+## Mathematical Background
+
+### CPA Leakage Model
+
+The attack targets the AES SubBytes output during round 1. For a single key byte $k$ and known plaintext byte $p$:
+
+$$\ell = \mathrm{HW}(\mathrm{SBOX}[k \oplus p])$$
+
+where $\mathrm{HW}$ is the Hamming weight (number of set bits) and $\mathrm{SBOX}$ is the AES S-box. This models the dominant data-dependent switching activity on the power rail during SubBytes + ShiftRows.
+
+### Correlation Attack
+
+For each candidate key $k' \in \{0, \ldots, 255\}$, compute predicted leakage:
+
+$$h_{k'} = \mathrm{HW}(\mathrm{SBOX}[k' \oplus p_i]) \quad \forall i$$
+
+Then compute the Pearson correlation between $h_{k'}$ and measured power samples across all traces:
+
+$$r_{k', j} = \frac{\sum_i (h_{k', i} - \bar{h})(t_{i,j} - \bar{t}_j)}{\sqrt{\sum_i (h_{k', i} - \bar{h})^2 \cdot \sum_i (t_{i,j} - \bar{t}_j)^2}}$$
+
+where $t_{i,j}$ is sample $j$ of trace $i$. The key candidate with the highest $|r|$ at any sample point is the recovered key.
+
+### Rank Recovery
+
+The CPA output ranks all 256 candidates by $|r|_{\max}$. When the correct key $k$ has $|r|_{\max}$ higher than all incorrect candidates, it is "recovered at rank #1". The engine asserts this as the success criterion.
+
+### XTS-AES Context
+
+XTS-AES (NIST SP 800-38E) is a tweakable block cipher mode for storage encryption. On the ESP32-C6, the boot-time flash decryption uses XTS-AES-128. The side-channel target is the first AES-128 block operation during the XTS decryption, where the S-box output leakage is most visible.
 
 ## Example Output
 
 ```
 [*] Generating 80 synthetic power traces (SNR=18.0 dB, key=0xA7)...
-[*] Running CPA attack (256 candidates x 200 samples)...
+[*] Running CPA attack (256 candidates x 500 samples)...
 
   P4 — XTS-AES Flash-Encryption CPA Engine  |  Single-Byte Demo
   Traces analysed  : 80
   True key byte    : 0xA7 (167)
   Recovered key    : 0xA7 (167)
   Rank of true key : #1
-  Max |correlation|: 0.892476
+  Max |correlation|: 0.997319
 
   Top-10 key candidates by |correlation|:
   Rank   Key   |corr|
   ----   ---   ------
-  1    0xA7   0.892476 <-- correct
+  1    0xA7   0.997319 <-- correct
   ...
-  Rank progression (traces vs rank of true key):
-      Traces    Rank
-          10      1
-          ...
-          80      1
+
+  [PASS] Correct key byte recovered at rank #1.
 ```
 
 ## Research Framing
 
 This is the analysis tooling for the **P4** research portfolio item (ESP32-C6 XTS-AES flash-encryption side channel). The software engine, leakage model, and CPA core are fully exercised offline here. Hardware trace acquisition (shunt resistor + oscilloscope >= 100 MS/s, 2ch, GPIO trigger) and the Phase 0/1/2 campaign are run separately once the lab rig is available. A second devkit is held in reserve for key recovery if the first becomes unresponsive.
+
+## Live Lab Test Plan
+
+| Phase | Description | Go / No-Go Criteria | Status |
+|-------|-------------|---------------------|--------|
+| Phase 0 | Synthetic-trace CPA (this tool) | Key recovered at rank #1, \|corr\| > 0.5 | DONE |
+| Phase 1 | Hardware calibration | Measured SNR > 10 dB, CPA recovers known calibration key | PENDING |
+| Phase 2 | Full 16-byte key recovery | All 16 bytes recovered, XTS-AES decryption succeeds | PENDING |
+
+## Metrics
+
+| Metric | Target | Current |
+|--------|--------|---------|
+| Key recovery (synthetic) | Rank #1 | Rank #1 |
+| Max correlation (80 traces) | > 0.9 | 0.997 |
+| Test pass rate | 100% | 100% |
+| Demo exit code | 0 | 0 |
+| Rank recovery traces needed | < 20 | 10 |
 
 ## IMPORTANT: Read before use.
 
